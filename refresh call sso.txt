@@ -1,0 +1,663 @@
+const Axios = require('axios');
+const Cookie = require('cookie');
+const Crypto = require('crypto');
+const JsonWebToken = require('jsonwebtoken');
+const fs = require('fs');
+const Log = require('./log');
+const https = require('https');
+
+let deps;
+let log;
+let privateKey;
+let publicKey;
+let ssoTokenResponse;
+let ssoUserDetails;
+let evolokServiceResp;
+let vklTokenResp;
+let constVar;
+let refsCode;
+let cookieVal;
+let stageVar;
+let registrationFlag;
+ 
+module.exports.handler = async (event, ctx, cb, setDeps = setDependencies) => {
+	log = new Log(event, ctx);
+	deps = setDeps(deps);
+	stageVar = event.stageVariables;
+	constVar = process.env;	
+	try {
+		await setJwks();
+		return await authenticate(event);
+	} catch (err) {
+		log.error(err.message, { event: event }, err);
+	}
+};
+
+function setDependencies(dependencies) {
+	if (dependencies === undefined || dependencies === null) {
+		return {
+		    axios: Axios
+		};
+	}
+	return dependencies; 
+}
+
+async function authenticate(evt) {
+	const {cookies, rawQueryString } = evt;
+	const queryString= rawQueryString;
+	cookieVal = cookies;
+	refsCode = false;
+	
+	if ('cookies' in evt && queryString.indexOf('a=in')>-1 ) {
+		registrationFlag = queryString.indexOf('signUpFlag=true')>-1 ? true : false;
+		if(getCookieValue(cookies, constVar.Cookie_id_token)) {
+			return getVerifyJwtResponse(evt);
+		}
+	}
+	
+	if (queryString !=="" && queryString.indexOf('code')>-1) {
+		log.info("inside queryString ", evt);
+		return getNewJwtResponse({ evt }); 
+	}
+	
+	/*if ('cookies' in evt && queryString.indexOf('a=rf')>-1 ) {
+		log.info("get refersh token", evt)
+		return getRefreshTokenResponse(evt);
+	}*/
+	
+	if ( queryString.indexOf('a=rfesi')>-1 ) {
+		log.info("Backend refersh token call", evt);
+		let evSid = new URLSearchParams(evt.rawQueryString).get('ev_sid');
+		let evDid = new URLSearchParams(evt.rawQueryString).get('ev_did');
+		let rft = new URLSearchParams(evt.rawQueryString).get('mmu_rft'); 
+		new URLSearchParams(evt.rawQueryString).get('code');
+		
+    	return getEsiRefTokenResponse(evt, rft, evSid, evDid);
+    	}
+	
+	
+	if (queryString !=="" && queryString.indexOf('a=out')>-1) {
+		log.info("inside queryString logout", evt)
+		return callLogoutSession(evt); 
+	}
+	
+	return getOidcRedirectPayload(evt);
+}
+
+async function setJwks() {
+	if (privateKey === undefined && publicKey === undefined) {
+		 privateKey = fs.readFileSync('./private.key', 'utf-8');
+		 publicKey = fs.readFileSync('./public.key', 'utf-8'); 
+	}
+}
+
+async function getVerifyJwtResponse(evt) {
+	let pageUrl = evt.queryStringParameters.pageURL;
+	
+	try {
+		let tokenValue = getCookieValue(evt.cookies, constVar.Cookie_id_token);
+			await verifyToken(tokenValue, publicKey, { algorithms: ['RS256'] });
+
+	 return  {
+			statusCode:  302,
+			statusDescription: 'Found',
+			body:  true , //'ID token retrieved.',
+			headers: {
+				location: pageUrl, 
+				"cache-control": "max-age=0, no-cache, no-store, must-revalidate"
+			}
+		}
+		
+		} catch (err) {
+			switch (err.name) {
+				case 'TokenExpiredError':
+					return getOidcRedirectPayload(evt);
+				case 'JsonWebTokenError':
+					log.warn('jwt error, unauthorized', undefined, err);
+					return getOidcRedirectPayload(evt);
+				default:
+					return getUnauthorizedPayload('Unauthorized.', `User is not permitted`, '');
+			}
+		}
+}
+
+function getCookieValue(cookies, cookieName){
+	let findCookie = cookieName + "=";
+	let cookieValue;
+
+    for (var i = 0; i < cookies.length; i++) {
+        if(cookies[i].indexOf(findCookie) === 0) {
+            cookieValue = cookies[i].replace(findCookie, '');
+        }
+    }
+    return cookieValue && cookieValue.trim();
+}
+
+async function getNewJwtResponse({ evt }) {
+	const {  decodedToken, tokenResp } = await getIdAndDecodedToken(evt);
+	return await processJwtResponse(evt, decodedToken, tokenResp);
+}
+
+async function processJwtResponse(evt, decodedToken, tokenResp) {
+	ssoTokenResponse = tokenResp;
+	ssoUserDetails = decodedToken;
+	log.info("decoded token values", decodedToken);
+	evolokServiceResp = await getEvolokUserDetails(evt); 
+	//log.info("evolokServiceResp", evolokServiceResp);
+	vklTokenResp = await setVuukleUserAuthToken();
+//	log.info("vuukle Response", vklTokenResp);
+
+	let payloadObj = decodedToken.payload;
+	let evSS = evolokServiceResp.mainSession.sessionId;
+	let firstName = encodeURIComponent(payloadObj.firstName);
+	await getAmpAuthorize(evt, vklTokenResp, firstName, evSS);
+	//log.info("ampAuthorize Response", ampResponse);
+	
+	/*if(evolokServiceResp.mainSession.sessionId) {
+		await deleteEvolokSession(evt);
+	}*/
+	
+	try {
+		if ('cookies' in evt && validateNonce(decodedToken.payload.nonce, getCookieValue(evt.cookies, constVar.Cookie_nonce)) !==undefined)
+			{
+				//log.info("inside ref-token cookie checks 1111")
+				return getRedirectPayload({ evt, decodedToken });
+			}
+			
+			//refresh token call
+		if ('cookies' in evt && getCookieValue(evt.cookies, constVar.Cookie_ref_token)!==undefined)
+			{
+				//log.info("inside ref-token cookie checks")
+				return getRedirectPayload({ evt, decodedToken});
+			}
+		
+		return getUnauthorizedPayload('Nonce Verification Failed', '', '');
+			
+		} catch (err) {
+			switch (err.name) {
+				case 'TokenExpiredError':
+					log.warn('token expired, redirecting to OIDC provider', undefined, err);
+					return getOidcRedirectPayload(evt);
+				case 'JsonWebTokenError':
+					log.warn('jwt error, unauthorized', undefined, err);
+					return getUnauthorizedPayload('Json Web Token Error', err.message, '');
+				default:
+					log.warn('unknown JWT error, unauthorized', undefined, err);
+					return getUnauthorizedPayload(/'Unknown JWT',/`User ${decodedToken.payload.email || 'user'} is not permitted`,'');
+			}
+		}
+}
+
+async function getAmpAuthorize(evt, vklToken, fName, evSS) {
+	let evlkHostUrl = stageVar.evolok_host_url;
+	let vklTokenVal = vklToken ? "vtoken="+vklToken : "vtoken=''";
+	let evss = evSS ? "ev_ss="+evSS : "ev_ss=''";
+	let firstName = fName ? "displayName="+fName : "displayName=''";
+	let evSID = getCookieValue(evt.cookies, constVar.Cookie_ev_sid);
+	let evDID = getCookieValue(evt.cookies, constVar.Cookie_ev_did);
+	let evlkQueryParam = 'ev_sid='+ evSID+';ev_did='+evDID;
+	let path = "/acd/api/3.0/authorize/json?"+vklTokenVal+"&"+firstName+"&"+evss;
+	return await getAmpAuthorizeService(evlkHostUrl, path, constVar.evolok_method_get,evlkQueryParam)
+}
+
+const getAmpAuthorizeService = (hostUrl, path, method,evlkQueryParam) => new Promise((resolve, reject) => {
+//log.info(" getAmpAuthorizeService call **** ",hostUrl +''+path+''+method)
+    const options = { host: hostUrl,
+    headers: {
+      "cache-control": "no-cache",
+      "cookie":evlkQueryParam
+    }, path, method: method };
+    
+    const req = https.request(options, res => {
+        let buffer = "";
+        res.on('data', chunk => buffer += chunk)
+       
+        res.on('end', () => resolve(JSON.parse(buffer)))
+    });
+    req.on('error', e => reject(e.message));
+    req.end();
+})
+
+
+async function getEvolokUserDetails(evt) {
+	log.info("inside getEvolokUserDetails")
+	let evlkHostUrl = stageVar.evolok_host_url;
+	let evlkSessionPath = constVar.evolok_path_session;
+	let evlkProfilePath = constVar.evolok_path_prof;
+	let evlkAuthHeadSession = constVar.evolok_auth_session;
+	let	evlkAuthHeadReg = constVar.evolok_auth_profile	
+	let method = constVar.evolok_method_post;
+	let payload = getEvUserDetails(evt);
+	let evSID = getCookieValue(evt.cookies, constVar.Cookie_ev_sid);
+	let evDID = getCookieValue(evt.cookies, constVar.Cookie_ev_did);
+	let evlkQueryParam = 'ev_sid='+ evSID+';ev_did='+evDID;
+	//log.info("evlkQueryParam", evlkQueryParam);
+	let evlkResponse = await getEvolokService(evlkHostUrl, payload, evlkSessionPath, evlkAuthHeadSession, method, evlkQueryParam);
+	//log.info(" evlkResponse payload", payload)
+    if(evlkResponse && evlkResponse.message === null) {
+    	switch (evlkResponse.code) {
+			case 'IDENTIFIERS_NOT_FOUND':{
+				let registerdUser = evlkUserRegistration(evt);
+				await getEvolokService(evlkHostUrl, registerdUser, evlkProfilePath, evlkAuthHeadReg, method, evlkQueryParam);
+				evlkResponse = await getEvolokService(evlkHostUrl, payload, evlkSessionPath, evlkAuthHeadSession, method, evlkQueryParam);
+			}
+    	}
+    }
+    //log.info("inside evlkResponse last", evlkResponse)
+    return evlkResponse;
+}
+
+async function deleteEvolokSession(evt) {
+//	log.info("delete evolok")
+	let evlkHostUrl = stageVar.evolok_host_url;
+	let deletMethod = constVar.evolok_method_delete;
+	
+	let evlkSessionPath = constVar.evolok_path_session;
+	let sessionId = getCookieValue(evt.cookies, constVar.Cookie_ev_ss);
+	let evSID = getCookieValue(evt.cookies, constVar.Cookie_ev_sid);
+	let evDID = getCookieValue(evt.cookies, constVar.Cookie_ev_did);
+	let evlkQueryParam = 'ev_sid='+ evSID+';ev_did='+evDID;
+
+	let evlkAuthSession = 'Evolok evolok.api.service=login evolok.api.sessionId='
+	evlkSessionPath = evlkSessionPath +'/'+sessionId;
+	return await getEvolokDeleteService(evlkHostUrl, 'null', evlkSessionPath, evlkAuthSession, deletMethod, evlkQueryParam);
+	
+}
+
+const getEvolokService = (hostUrl, payload, path, auth, method,evlkQueryParam) => new Promise((resolve, reject) => {
+//log.info(" getEvolokService ",hostUrl +''+path+''+auth+''+method)
+    const options = { host: hostUrl,
+    headers: {
+      "content-type": "application/json",
+      "accept": "application/json",
+      "authorization": auth,
+      "cache-control": "no-cache",
+      "cookie":evlkQueryParam
+    }, path, method: method };
+    
+    const req = https.request(options, res => {
+        let buffer = "";
+        res.on('data', chunk => buffer += chunk)
+        res.on('end', () => resolve(JSON.parse(buffer)))
+    });
+    req.on('error', e => reject(e.message));
+    req.write(JSON.stringify(payload));
+    req.end();
+})
+
+
+const getEvolokDeleteService = (hostUrl, payload, path, auth, method, evlkQueryParam) => new Promise((resolve, reject) => {
+    const options = { host: hostUrl,
+    headers: {
+      "accept": "application/json",
+      "authorization": auth,
+      "cookie":evlkQueryParam,
+    }, path, method: method };
+    
+    const req = https.request(options, res => {
+        let buffer = "";
+        res.on('data', chunk => buffer += chunk)
+        res.on('end', () => resolve(buffer))
+    });
+    req.on('error', e => reject(e.message));
+    req.write(JSON.stringify(payload));
+    req.end();
+})
+
+function evlkUserRegistration (evt) {
+	let payloadObj = ssoUserDetails.payload;
+	log.info("mobileVerified -->", payloadObj.mobileVerified)
+	return {
+	  "realm" : constVar.evolok_realm_value,
+	  "brand" : constVar.evolok_brand,
+	  "channel" : constVar.evolok_channel,
+	  "attributes" : [ 
+	  	  {"name" : constVar.evolok_name,
+		   "value" : payloadObj.name
+		  },
+		  {"name" : constVar.evolok_email,
+		    "value" : payloadObj.email
+		  },
+		  {"name" : constVar.evolok_pass_key,
+		    "value" : constVar.evolok_pass_value
+		  },
+		  {"name" : constVar.evolok_firstname,
+		    "value" : payloadObj.firstName
+		  },
+		  {"name" : constVar.evolok_lastname,
+		    "value" : payloadObj.lastName
+		  },
+		  {"name" : constVar.evolok_emailverified,
+	    	"value" : payloadObj.emailVerified == 1 ? true : false
+		  },
+		   {"name" : constVar.evolok_subscriber_id,
+		    "value" : payloadObj.sub
+		  },
+		  
+		   {"name" : constVar.evolok_phoneverified,
+		    "value" : payloadObj.mobileVerified == 1 ? true : false
+		  },
+		   payloadObj.mobileVerified == 1 ? 
+		  {
+		  	"name" : 'billingmobilenumber',  
+			"value" : payloadObj.mobileNumber, 
+		   
+		  }:{"name":'',"value":''},
+		  payloadObj.mobileVerified == 1 ? 
+		  {
+		    "name" : constVar.evolok_phonenumber,
+		    "value" : payloadObj.mobileNumber,
+		  }:{"name":'',"value":''}
+		],
+	  "services" : [ "registration" ],
+	  "roles" : [ ],
+	  "rolesToAssign" : []
+	}
+}
+
+function getEvUserDetails(evt) {
+	let payloadObj = ssoUserDetails.payload;
+
+	return {
+	  "realmName" : constVar.evolok_realm_value,
+	  "authenticationSchemeName" : constVar.evolok_auth_scheme,
+	  "ipAddress" : null,
+	  "rememberMe" : false,
+	  "device" : null,
+	  "brand" : constVar.evolok_brand,
+	  "channel" : constVar.evolok_channel,
+	  "identifiers" : [ {
+	    "name" : constVar.evolok_email,
+	    "value" : payloadObj.email
+	  } ],
+	  "validators" : [ {
+	    "name" : constVar.evolok_pass_key,
+	    "value" : constVar.evolok_pass_value
+	  } ]
+	}
+}
+
+function setVuukleKey(evt){
+	let vklApiKey = constVar.vuukle_apikey;
+	let vklSecretKey = constVar.vuukle_secretkey;
+	return {vklApiKey, vklSecretKey}
+}
+function vuShaHashing(email, key){
+	let hashVal = email+'-'+key;
+	let hash = Crypto.createHash('sha512').update(hashVal, 'utf-8').digest('hex');
+	return hash;
+}
+
+function createGenInfojson(email, profileName, apikey, signature) {
+	 let infoObj = {
+		"username": profileName,
+		"email": email,
+		"public_key": apikey,
+		"signature": signature
+	}
+	
+	return JSON.stringify(infoObj)
+}
+
+async function setVuukleUserAuthToken(evt) {
+	let payloadObj = ssoUserDetails.payload;
+	log.info("payload obj", payloadObj)
+	let {vklApiKey, vklSecretKey} = setVuukleKey();
+	let ssoEmailId = payloadObj.email
+	let ssoProfileName = payloadObj.name
+	let vklsignature = vuShaHashing(ssoEmailId, vklSecretKey);
+	let genInfo = createGenInfojson(ssoEmailId, ssoProfileName, vklApiKey, vklsignature);
+	let buff = Buffer.from(genInfo);
+	let vklTokenval = buff.toString('base64');
+	
+	return vklTokenval;
+}
+
+async function getRefreshTokenResponse(evt) {
+	log.info("inside getRefreshTokenResponse", evt)
+	const tokenRequestURL = constVar.token_url;
+	const redirectURI =  stageVar.redirect_url;	
+	const clientId = stageVar.client_id;
+	const grantTypeRFToken = constVar.refresh_token;
+	const client_secret = stageVar.client_secret;
+	let refTokenCookie = getCookieValue(evt.cookies, constVar.Cookie_ref_token);
+
+	if (refTokenCookie !=='' && !refsCode) {
+		refsCode = true;
+		let	encodedRefToken = refTokenCookie && Buffer.from(refTokenCookie, 'base64').toString('ascii');
+		let queryParam = tokenRequestURL+'?client_id='+clientId+'&redirect_uri='+redirectURI+'&grant_type='+grantTypeRFToken+'&client_secret='+client_secret+'&refresh_token='+encodedRefToken
+		
+		let webTokenResp = await webTokenValidation(queryParam);
+		try {
+			return await processJwtResponse(evt, webTokenResp.decodedToken, webTokenResp.tokenResp);
+				
+		}catch(err){
+			log.warn('unauthorized', undefined, err);
+			 return getUnauthorizedPayload(err); 
+		}	
+	}
+}
+
+async function getEsiRefTokenResponse(evt, rft, evSid, evDid) {
+	log.info("esi getRefreshTokenResponse", rft)
+	const tokenRequestURL = constVar.token_url;
+	const redirectURI =  stageVar.redirect_url;	
+	const clientId = stageVar.client_id;
+	const grantTypeRFToken = constVar.refresh_token;
+	const client_secret = stageVar.client_secret;
+	let refTokenValue = rft;
+	log.info("refersh token value inside ", rft)
+
+	if (refTokenValue !=='' && !refsCode) {
+		refsCode = true;
+		let	encodedRefToken = refTokenValue && Buffer.from(refTokenValue, 'base64').toString('ascii');
+		log.info("encodedRefToken token value", encodedRefToken)
+		let queryParam = tokenRequestURL+'?client_id='+clientId+'&redirect_uri='+redirectURI+'&grant_type='+grantTypeRFToken+'&client_secret='+client_secret+'&refresh_token='+encodedRefToken
+		
+		let webTokenResp = await webTokenValidation(queryParam);
+		try {
+			return await processJwtResponse(evt, webTokenResp.decodedToken, webTokenResp.tokenResp);
+				
+		}catch(err){
+			log.warn('unauthorized', undefined, err);
+			 return getUnauthorizedPayload(err); 
+		}	
+	}
+}
+
+
+function getRedirectPayload({ evt, decodedToken }) {
+	log.info("inside getRedirectPayload refsCode", refsCode);
+	let msId = evolokServiceResp.mainSession.sessionId;
+	let msIdExp = evolokServiceResp.mainSession.expiry;
+	let ssId = evolokServiceResp.secureSession.sessionId;
+	let ssIdExp = evolokServiceResp.secureSession.expiry;
+	let encodedRefToken =  getDecodedRefreshToken(ssoTokenResponse);
+	let refTokenExp = parseInt(constVar.ref_token_age);
+	let vklTokenExp = parseInt(constVar.vkl_token_age);
+	let payload = decodedToken.payload;
+	let cookiePageUrl = getCookieValue(cookieVal, constVar.Cookie_page_url	);
+	let redirectPageUrl = cookiePageUrl ? decodeURIComponent(cookiePageUrl) : stageVar.landing_page_url;
+	let disp_name = decodeURIComponent(ssoUserDetails.payload.name);
+	let refTokenInterval =  parseInt(constVar.ref_interval) * 1000 * 60;
+	let lastRefreshTime = Date.now();
+	let md5HexVal =  Crypto.createHash('md5').update(constVar.jwtHashTag + encodedRefToken).digest("hex");
+	let html = `<esi:assign name="ev_ss" value="${msId}"></esi:assign>
+			   <esi:assign name="ex_ss" value="${ssId}"></esi:assign>
+			   <esi:assign name="ev_timestamp" value="${msIdExp}"></esi:assign>
+			   <esi:assign name="mmu_adf" value="${md5HexVal}"></esi:assign>
+			   <esi:assign name="mmu_rft" value="${encodedRefToken}"></esi:assign>`;
+			   
+	const response = {
+	   statusCode: refsCode ? 200 : 302,
+	   statusDescription: 'Found',
+	   body: refsCode ? html : '',
+	   headers: {
+		   location: refsCode ? "" : redirectPageUrl, 
+		   "Content-Type":  refsCode ? 'text/html;charset=utf-8': 'text/plain;charset=utf-8',
+		   "cache-control": "max-age=0, no-cache, no-store, must-revalidate"
+	   },
+	   
+	   cookies:[
+		   Cookie.serialize(constVar.Cookie_id_token, JsonWebToken.sign(payload, privateKey, { algorithm: 'RS256' }),{httpOnly: true, path: '/', expires: getExpiryDate(refTokenExp, 24)}),
+		   Cookie.serialize(constVar.Cookie_nonce, '', {path: '/',	expires: new Date(0)}),
+		   Cookie.serialize(constVar.Cookie_page_url, '', {path: '/',	expires: new Date(0)}),
+		   Cookie.serialize(constVar.Cookie_display_name, disp_name, {path: '/',	sameSite: 'none', secure: true, expires: getExpiryDate(refTokenExp, 24)}),
+		   Cookie.serialize(constVar.Cookie_ev_ss, msId, {path: '/',	sameSite: 'none', secure: true, expires: new Date(msIdExp)}),
+		   Cookie.serialize(constVar.Cookie_ex_ss, ssId, {path: '/',	sameSite: 'none', secure: true, expires: new Date(ssIdExp)}),
+		   Cookie.serialize(constVar.Cookie_vkl_token, vklTokenResp, {path: '/', encode: v => v, sameSite: 'none', secure: true, expires: getExpiryDate(vklTokenExp, 24)}), 
+		   Cookie.serialize(constVar.Cookie_ref_token, '', {path: '/', expires: new Date(0)}),
+		   Cookie.serialize(constVar.Cookie_ref_token, encodedRefToken, {path: '/', expires: getExpiryDate(refTokenExp, 24)}),
+		   Cookie.serialize(constVar.Cookie_login, constVar.user_logged_key, {path: '/', expires: getExpiryDate(refTokenExp, 24)}),
+		   Cookie.serialize(constVar.Cookie_sso_ls_rfd, lastRefreshTime, {path: '/', expires: getExpiryDate(refTokenExp, 24)}),
+		   Cookie.serialize(constVar.Cookie_sso_rf_inv, refTokenInterval, {path: '/', expires: getExpiryDate(refTokenExp, 24)}),
+		   Cookie.serialize(constVar.Cookie_mmu_adf, md5HexVal, {path: '/', expires: getExpiryDate(refTokenExp, 24)}),
+	   ]
+   }; 
+   
+   log.info("Last response", response);
+   
+   return response;
+}
+
+function getExpiryDate(hour, hoursperday) {
+	return new Date(Date.now()+(hour * hoursperday * 60 * 60 * 1000 ))
+}
+
+function getDecodedRefreshToken(code){
+	let token = code.refresh_token;
+	let buffObj = Buffer.from(token, "utf8");
+	let tokenResp = buffObj.toString("base64");
+
+	return tokenResp;
+}
+
+async function verifyToken(token, pubkey, algorithms) {
+	return new Promise((resolve, reject) => {
+		JsonWebToken.verify(token, pubkey, algorithms, (err, decoded) => {
+			if (err) {
+				log.error('verifyJwt failed', err);
+				return reject(err);
+			}
+			return resolve(decoded);
+		});
+	});
+}
+
+async function getIdAndDecodedToken(evt) {
+	const tokenURI =constVar.token_url;
+	const clientId = stageVar.client_id;
+	const redirectURL = stageVar.redirect_url;
+	const grantType = constVar.grant_type;
+	const client_secret = stageVar.client_secret;
+	const code = new URLSearchParams(evt.rawQueryString).get('code');
+	const tokentRequestURL = tokenURI+'?client_id='+clientId+'&redirect_uri='+redirectURL+'&grant_type='+grantType+'&client_secret='+client_secret+'&code='+code;
+	
+	return await webTokenValidation(tokentRequestURL);
+}
+
+async function webTokenValidation(tokenRequest) {
+		try {
+			const response = await deps.axios.post(tokenRequest, {})
+	        const decodedToken = JsonWebToken.decode(response.data.id_token, {
+				complete: true
+			}); 
+			
+			return { idToken: response.data.id_token, decodedToken, tokenResp: response.data };
+	    } catch (err) {
+	        log.info("error--->",err)
+	        return getUnauthorizedPayload(err);
+	    }
+}
+
+// /Redirecting to OIDC provider
+
+function getOidcRedirectPayload(evt) {
+	log.info("inside getOidcRedirectPayload")
+	const { nonce, hash } = getNonceAndState();
+	const scope = "openid+email+profile+offline_access+mobile";
+	const clientId = stageVar.client_id;
+	const responseType = constVar.response_type;
+	const regFlag = registrationFlag ? '&landing=register' :'';
+	const redirectURI = stageVar.redirect_url + regFlag;
+	const baseURL = constVar.base_url;
+	const redirectURL = baseURL + '?scope='+scope + '&response_type='+ responseType +'&client_id='+clientId+'&prompt=consent&state='+hash+'&nonce='+ nonce +'&redirect_uri='+redirectURI
+	const currentPageurl = new URLSearchParams(evt.rawQueryString).get('pageURL') || ''; 
+	const resp = {
+		statusCode: 302,
+		body: redirectURL,
+		headers : {
+			Location: redirectURL,
+			"cache-control": "max-age=0, no-cache, no-store, must-revalidate"
+		},
+		cookies: [
+		    Cookie.serialize(constVar.Cookie_nonce, hash, {path: '/',	httpOnly: true}),
+		    Cookie.serialize(constVar.Cookie_id_token, '',{path: '/', expires: new Date(0)}),
+		    Cookie.serialize(constVar.Cookie_page_url, currentPageurl, {path: '/', httpOnly: true})
+		]
+	}
+		
+	return resp
+}
+
+function getNonceAndState() {
+	const nonce = Crypto.randomBytes(32).toString('hex');
+	const hash = Crypto.createHmac('sha256', nonce).digest('hex');
+	return { nonce, hash };
+}
+
+// validateNonce validates a nonce.
+function validateNonce(nonce, state) {
+	const other = Crypto.createHmac('sha256', nonce).digest('hex');
+	return other === state;
+}
+
+function getUnauthorizedPayload(error) {
+	let cookiePageUrl = getCookieValue(cookieVal, constVar.Cookie_page_url	);
+	let redirectPageUrl = cookiePageUrl ? decodeURIComponent(cookiePageUrl) : stageVar.landing_page_url;
+		return {
+		statusCode: 400,
+		body: redirectPageUrl,
+		statusDescription: 'not found',
+		headers: {
+			location: redirectPageUrl,
+			"cache-control": "max-age=0, no-cache, no-store, must-revalidate"
+		},
+		//cookies:  resetAllCookies()
+	};
+}
+
+async function callLogoutSession(evt) {
+	await deleteEvolokSession(evt)
+	await getAmpAuthorize(evt);
+	let pageUrl = new URLSearchParams(evt.rawQueryString).get('pageURL'); 
+	return {
+		statusCode: 302,
+		statusDescription: 'Found',
+		body: 'Logout from SSO provider',
+		headers : {
+			Location: pageUrl, 
+			"cache-control": "max-age=0, no-cache, no-store, must-revalidate"
+		}, 
+		cookies: resetAllCookies()
+	}
+}
+
+function resetAllCookies () {
+//	log.info("reset Cookies");
+	return [
+		Cookie.serialize(constVar.Cookie_nonce, '', {path: '/',	expires: new Date(0)}),
+		 Cookie.serialize(constVar.Cookie_page_url, '', {path: '/',	expires: new Date(0)}),
+	    Cookie.serialize(constVar.Cookie_id_token, '',{path: '/', expires: new Date(0)}),
+	    Cookie.serialize(constVar.Cookie_ev_ss, '', {path: '/',	 expires: new Date(0)}),
+		Cookie.serialize(constVar.Cookie_ex_ss, '', {path: '/',	expires: new Date(0)}),
+		Cookie.serialize(constVar.Cookie_vkl_token, '', {path: '/', expires: new Date(0)}),
+		Cookie.serialize(constVar.Cookie_ref_token, '', {path: '/', expires: new Date(0)}),
+		Cookie.serialize(constVar.Cookie_login, '', {path: '/', expires: new Date(0)}),
+		Cookie.serialize(constVar.Cookie_sso_ls_rfd, '', {path: '/',  expires: new Date(0)}),
+		Cookie.serialize(constVar.Cookie_sso_rf_inv, '', {path: '/', expires: new Date(0)}),
+		Cookie.serialize(constVar.Cookie_display_name, '', {path: '/', expires: new Date(0)}),
+		Cookie.serialize('MMID', '', {path: '/', domain:'.manoramaonline.com', expires: new Date(0)}),
+		Cookie.serialize(constVar.Cookie_mmu_adf, '', {path: '/', expires: new Date(0)})
+	]
+}
